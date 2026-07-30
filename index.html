@@ -183,6 +183,26 @@
   .recipe-list-head .dash-h2{ margin-bottom:0; }
   .recipe-list-head .count{ font-size:10.5px; color:var(--ink-soft); }
 
+  .settings-card{
+    background:var(--paper); border:1px solid var(--line); border-radius:12px; padding:6px 16px; box-shadow:var(--shadow);
+  }
+  .settings-row{
+    display:flex; align-items:center; justify-content:space-between; gap:14px; padding:13px 0;
+    border-bottom:1px dashed var(--line); flex-wrap:wrap;
+  }
+  .settings-row:last-child{ border-bottom:none; }
+  .settings-title{ font-size:12.5px; font-weight:700; }
+  .settings-sub{ font-size:10.3px; color:var(--ink-soft); margin-top:2px; line-height:1.6; max-width:340px; }
+  .settings-btn{
+    background:none; border:1px solid var(--line); color:var(--ink); font-size:11.5px;
+    padding:7px 14px; border-radius:18px; cursor:pointer; white-space:nowrap;
+  }
+  .settings-btn:hover{ background:#f1e7d3; }
+  .settings-btn.primary{ background:#3c2a1d; color:#fff; border-color:#3c2a1d; }
+  .settings-btn.primary:hover{ filter:brightness(1.1); }
+  .settings-btn-group{ display:flex; gap:8px; flex-shrink:0; }
+  .settings-btn:disabled{ opacity:.5; cursor:default; }
+
   /* ---------- detail ---------- */
   .detail{ display:none; }
   .detail.active{ display:block; }
@@ -604,6 +624,30 @@
     </div>
     <div class="recipe-grid" id="recipeGrid"></div>
 
+    <div class="dash-section">
+      <h2 class="dash-h2 serif"><span class="dot"></span>設定・バックアップ</h2>
+      <div class="settings-card">
+        <div class="settings-row">
+          <div class="settings-info">
+            <div class="settings-title">🔔 タイマー完了通知</div>
+            <div class="settings-sub" id="notifStatus">画面から離れていても、タイマー終了時にお知らせします。</div>
+          </div>
+          <button class="settings-btn" id="notifEnableBtn">通知を許可する</button>
+        </div>
+        <div class="settings-row">
+          <div class="settings-info">
+            <div class="settings-title">💾 データのバックアップ</div>
+            <div class="settings-sub">自作レシピ・焼成ログ・進捗をファイルに書き出し／読み込みできます。</div>
+          </div>
+          <div class="settings-btn-group">
+            <input type="file" accept="application/json" id="importFileInput" style="display:none;">
+            <button class="settings-btn" id="importBtn">📥 読み込む</button>
+            <button class="settings-btn primary" id="exportBtn">📤 書き出す</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div class="home-foot">自家製パン ラボ　粉量250g・完全版がベース ｜ 進捗はこの端末に自動保存されます</div>
   </div>
 
@@ -776,13 +820,17 @@ function playChime(){
   }catch(e){}
 }
 
-function updateStepTimerUI(rid, i, entry){
+function remainingFor(entry){
+  return Math.max(0, Math.round((entry.endTime - Date.now())/1000));
+}
+
+function updateStepTimerUI(rid, i, remaining, total){
   const ring = document.getElementById(`ring-${rid}-${i}`);
   const label = document.getElementById(`ringlabel-${rid}-${i}`);
   const btn = document.getElementById(`timerbtn-${rid}-${i}`);
   const steam = document.getElementById(`steam-${rid}-${i}`);
-  if(ring){ ring.setAttribute('stroke-dashoffset', String(119.4*(1-entry.remaining/entry.total))); }
-  if(label){ label.textContent = fmtTime(entry.remaining); }
+  if(ring){ ring.setAttribute('stroke-dashoffset', String(119.4*(1-remaining/total))); }
+  if(label){ label.textContent = fmtTime(remaining); }
   if(btn){ btn.textContent = '停止する'; btn.classList.add('running'); }
   if(steam){ steam.classList.add('on'); }
 }
@@ -803,31 +851,118 @@ function resetStepTimerUI(rid, i, minutesLabel){
   if(steam){ steam.classList.remove('on'); }
 }
 
+/* ---- notifications ---- */
+let notifPermissionRequested = false;
+function requestNotificationPermissionIfNeeded(){
+  if(!('Notification' in window)) return;
+  if(Notification.permission === 'default' && !notifPermissionRequested){
+    notifPermissionRequested = true;
+    try{ Notification.requestPermission().catch(()=>{}); }catch(e){}
+  }
+}
+function notifyTimerDone(entry){
+  playChime();
+  if('Notification' in window && Notification.permission === 'granted'){
+    try{
+      new Notification(`⏰ ${entry.stepTitle} が完了しました`, {
+        body: `${entry.recipeName} の工程時間です。`,
+        tag: 'panlab-'+entry.recipeId+'-'+entry.stepIndex
+      });
+    }catch(e){}
+  }
+}
+
+/* ---- screen wake lock ---- */
+let wakeLockSentinel = null;
+async function acquireWakeLock(){
+  if(!('wakeLock' in navigator)) return;
+  try{
+    if(wakeLockSentinel) return;
+    wakeLockSentinel = await navigator.wakeLock.request('screen');
+    wakeLockSentinel.addEventListener('release', ()=>{ wakeLockSentinel = null; });
+  }catch(e){ wakeLockSentinel = null; }
+}
+function releaseWakeLockIfHeld(){
+  if(wakeLockSentinel){
+    try{ wakeLockSentinel.release().catch(()=>{}); }catch(e){}
+    wakeLockSentinel = null;
+  }
+}
+function updateWakeLockState(){
+  const detailEl = document.getElementById('detail');
+  const detailActive = detailEl && detailEl.classList.contains('active');
+  const anyTimer = Object.keys(activeTimers).length>0;
+  if(detailActive || anyTimer){ acquireWakeLock(); }
+  else{ releaseWakeLockIfHeld(); }
+}
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState === 'visible'){
+    Object.keys(activeTimers).forEach(k=>tickTimerByKey(k));
+    updateWakeLockState();
+  }
+});
+
+/* ---- active-timer persistence (survives reload) ---- */
+async function persistActiveTimers(){
+  try{
+    const plain = {};
+    Object.keys(activeTimers).forEach(k=>{
+      const t = activeTimers[k];
+      plain[k] = {recipeId:t.recipeId, recipeName:t.recipeName, accent:t.accent, accentText:t.accentText,
+        stepIndex:t.stepIndex, stepTitle:t.stepTitle, total:t.total, endTime:t.endTime};
+    });
+    await window.storage.set('active-timers', JSON.stringify(plain), false);
+  }catch(e){}
+}
+async function restoreActiveTimers(){
+  try{
+    const res = await window.storage.get('active-timers', false);
+    if(res && res.value){
+      const plain = JSON.parse(res.value);
+      Object.keys(plain).forEach(key=>{
+        const t = plain[key];
+        if(remainingFor(t) > 0){
+          activeTimers[key] = Object.assign({}, t, {intervalId:null});
+          activeTimers[key].intervalId = setInterval(()=>tickTimerByKey(key), 1000);
+        }
+      });
+    }
+  }catch(e){}
+}
+
+function tickTimerByKey(key){
+  const entry = activeTimers[key];
+  if(!entry) return;
+  const remaining = remainingFor(entry);
+  updateStepTimerUI(entry.recipeId, entry.stepIndex, remaining, entry.total);
+  renderStickyBar();
+  if(remaining<=0){
+    clearInterval(entry.intervalId);
+    delete activeTimers[key];
+    finishStepTimerUI(entry.recipeId, entry.stepIndex);
+    renderStickyBar();
+    notifyTimerDone(entry);
+    persistActiveTimers();
+    updateWakeLockState();
+  }
+}
+
 function startTimer(r, i){
   const key = timerKey(r.id, i);
   if(activeTimers[key]) return;
+  requestNotificationPermissionIfNeeded();
   const minutes = r.steps[i].minutes;
   const total = minutes*60;
   const entry = {
     recipeId:r.id, recipeName:r.name, accent:r.accent, accentText:r.accentText,
-    stepIndex:i, stepTitle:r.steps[i].title, total, remaining: total, intervalId:null
+    stepIndex:i, stepTitle:r.steps[i].title, total,
+    endTime: Date.now() + total*1000, intervalId:null
   };
   activeTimers[key] = entry;
-  const tick = ()=>{
-    updateStepTimerUI(r.id, i, entry);
-    renderStickyBar();
-    if(entry.remaining<=0){
-      clearInterval(entry.intervalId);
-      delete activeTimers[key];
-      finishStepTimerUI(r.id, i);
-      renderStickyBar();
-      playChime();
-      return;
-    }
-    entry.remaining--;
-  };
-  entry.intervalId = setInterval(tick, 1000);
-  tick();
+  entry.intervalId = setInterval(()=>tickTimerByKey(key), 1000);
+  tickTimerByKey(key);
+  persistActiveTimers();
+  updateWakeLockState();
 }
 function stopTimer(rid, i){
   const key = timerKey(rid, i);
@@ -839,6 +974,8 @@ function stopTimer(rid, i){
   const minLabel = r ? (r.steps[i].minutes+'分') : '';
   resetStepTimerUI(rid, i, minLabel);
   renderStickyBar();
+  persistActiveTimers();
+  updateWakeLockState();
 }
 
 function renderStickyBar(){
@@ -850,19 +987,20 @@ function renderStickyBar(){
   bar.classList.add('show');
   bar.innerHTML = keys.map(key=>{
     const t = activeTimers[key];
+    const remaining = remainingFor(t);
     return `<div class="sticky-pill" style="--pill-accent:${t.accent}" data-rid="${t.recipeId}" data-i="${t.stepIndex}">
       <div class="sp-ring">
         <svg width="30" height="30" viewBox="0 0 30 30">
           <circle cx="15" cy="15" r="12.5" fill="none" stroke="rgba(255,255,255,0.25)" stroke-width="4"></circle>
           <circle cx="15" cy="15" r="12.5" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round"
-            transform="rotate(-90 15 15)" stroke-dasharray="78.5" stroke-dashoffset="${78.5*(1-t.remaining/t.total)}"></circle>
+            transform="rotate(-90 15 15)" stroke-dasharray="78.5" stroke-dashoffset="${78.5*(1-remaining/t.total)}"></circle>
         </svg>
       </div>
       <div class="sp-info">
         <div class="sp-recipe">${t.recipeName}</div>
         <div class="sp-step">${t.stepTitle}</div>
       </div>
-      <div class="sp-time">${fmtTime(t.remaining)}</div>
+      <div class="sp-time">${fmtTime(remaining)}</div>
       <button class="sp-stop" data-stop-rid="${t.recipeId}" data-stop-i="${t.stepIndex}">✕</button>
     </div>`;
   }).join('');
@@ -895,6 +1033,7 @@ function showView(name){
   document.getElementById('calendarView').classList.toggle('active', name==='calendar');
   document.getElementById('newRecipeView').classList.toggle('active', name==='newrecipe');
   document.getElementById('backBtn').style.display = (name==='detail') ? 'inline-flex' : 'none';
+  updateWakeLockState();
 }
 
 /* ---------------- render home ---------------- */
@@ -1045,6 +1184,93 @@ function renderHome(){
       renderHome();
     });
   });
+
+  wireSettingsCard();
+}
+
+function wireSettingsCard(){
+  const notifBtn = document.getElementById('notifEnableBtn');
+  const notifStatus = document.getElementById('notifStatus');
+  if(notifBtn){
+    const supported = 'Notification' in window;
+    if(!supported){
+      notifBtn.disabled = true; notifBtn.textContent = '非対応';
+      notifStatus.textContent = 'お使いの環境は通知に対応していません。';
+    }else if(Notification.permission === 'granted'){
+      notifBtn.disabled = true; notifBtn.textContent = '許可済み ✓';
+      notifStatus.textContent = 'タイマー終了時に通知でお知らせします。';
+    }else if(Notification.permission === 'denied'){
+      notifBtn.disabled = true; notifBtn.textContent = 'ブロック済み';
+      notifStatus.textContent = 'ブラウザの設定で通知がブロックされています。';
+    }else{
+      notifBtn.disabled = false; notifBtn.textContent = '通知を許可する';
+      notifBtn.onclick = async ()=>{
+        try{ await Notification.requestPermission(); }catch(e){}
+        wireSettingsCard();
+      };
+    }
+  }
+
+  const exportBtn = document.getElementById('exportBtn');
+  if(exportBtn) exportBtn.onclick = exportBackup;
+  const importBtn = document.getElementById('importBtn');
+  const importInput = document.getElementById('importFileInput');
+  if(importBtn) importBtn.onclick = ()=>importInput.click();
+  if(importInput) importInput.onchange = handleImportFile;
+}
+
+async function exportBackup(){
+  await loadCustomRecipes();
+  await loadLogs();
+  const progress = {};
+  RECIPES.concat(CUSTOM_RECIPES).forEach(r=>{
+    if(state[r.id]) progress[r.id] = state[r.id];
+  });
+  const payload = {
+    app: 'pan-lab-backup', version: 1, exportedAt: new Date().toISOString(),
+    customRecipes: CUSTOM_RECIPES, logs: logs, progress: progress
+  };
+  const blob = new Blob([JSON.stringify(payload)], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const dateStr = todayStr();
+  a.href = url;
+  a.download = `パンラボ_バックアップ_${dateStr}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url), 2000);
+}
+
+function handleImportFile(){
+  const input = document.getElementById('importFileInput');
+  const file = input.files[0];
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = async (e)=>{
+    let payload;
+    try{ payload = JSON.parse(e.target.result); }
+    catch(err){ alert('ファイルを読み込めませんでした。正しいバックアップファイルか確認してください。'); input.value=''; return; }
+    if(!payload || payload.app !== 'pan-lab-backup'){
+      alert('このファイルは自家製パンラボのバックアップ形式ではないようです。'); input.value=''; return;
+    }
+    const summary = `カスタムレシピ ${(payload.customRecipes||[]).length}件・焼成ログ ${(payload.logs||[]).length}件を読み込みます。\n現在のデータは上書きされます。続けますか？`;
+    if(!confirm(summary)){ input.value=''; return; }
+
+    CUSTOM_RECIPES = payload.customRecipes || [];
+    logs = payload.logs || [];
+    logsLoaded = true;
+    Object.keys(payload.progress||{}).forEach(rid=>{
+      state[rid] = payload.progress[rid];
+    });
+    await saveCustomRecipes();
+    await saveLogs();
+    await Promise.all(Object.keys(payload.progress||{}).map(rid=>saveProgress(rid, state[rid])));
+    input.value = '';
+    alert('データを読み込みました。');
+    renderHome();
+  };
+  reader.readAsText(file);
 }
 
 /* ---------------- render detail ---------------- */
@@ -1522,7 +1748,7 @@ function wireDetailEvents(r){
     if(!file) return;
     photoStatus.textContent = '圧縮中…';
     try{
-      const dataUrl = await compressImageFile(file, 480, 0.6);
+      const dataUrl = await compressImageFile(file, 420, 0.55);
       pendingPhoto = dataUrl;
       photoPreview.src = dataUrl;
       photoPreview.style.display = '';
@@ -2041,7 +2267,10 @@ async function initApp(){
     state[r.id] = buildStateFor(r, saved);
   }));
   await loadLogs();
+  await restoreActiveTimers();
   renderHome();
+  renderStickyBar();
+  updateWakeLockState();
 }
 
 document.getElementById('backBtn').addEventListener('click', closeDetail);
